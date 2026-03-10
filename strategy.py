@@ -1,5 +1,6 @@
 """
-策略引擎 - 陈凯三周期收敛图选股
+策略引擎 - 陈凯三周期收敛图选股（修复版）
+修复：将 debug_info 展开为独立列，避免 pandas 嵌套字典问题
 """
 import pandas as pd
 import numpy as np
@@ -9,6 +10,8 @@ from typing import Tuple, Optional
 import config as config
 import indicators as indicators
 from patterns import PatternManager, ChenKaiConvergencePattern
+import json  # 用于序列化 debug 数据
+
 class ChenKaiStrategyEngine:
     """
     陈凯三周期收敛图选股策略引擎
@@ -42,9 +45,11 @@ class ChenKaiStrategyEngine:
         }
         # 评分分布
         self.score_distribution = []
+    
     def _register_patterns(self):
         """注册形态插件"""
         self.pattern_manager.register('chenkai', ChenKaiConvergencePattern())
+    
     def run(self) -> pd.DataFrame:
         """
         执行完整选股流程
@@ -53,27 +58,35 @@ class ChenKaiStrategyEngine:
         """
         if self.raw_data.empty:
             return pd.DataFrame()
+        
         self._preprocess_data()
+        
         groups = list(self.raw_data.groupby('ts_code'))
         self.stats['total'] = len(groups)
+        
         self.logger.info("=" * 60)
         self.logger.info(f"📊 陈凯三周期收敛图选股系统 - {self.target_date}")
         self.logger.info("=" * 60)
         self.logger.info(f"总样本池: {self.stats['total']} 只")
+        
         # 阶段1: 基础硬性筛选
         self.logger.info("\n>>> 阶段1: 基础硬性筛选")
         candidates = self._basic_filter(groups)
         self.stats['passed_basic'] = len(candidates)
         self.logger.info(f"   ✅ 通过基础筛选: {self.stats['passed_basic']} 只")
+        
         if self.stats['passed_basic'] == 0:
             self.logger.warning("   ⚠️  无股票通过筛选")
             self._log_stats()
             return pd.DataFrame()
+        
         # 阶段2: 陈凯收敛图评分
         self.logger.info("\n>>> 阶段2: 陈凯收敛图识别与评分")
         self._evaluate_patterns(candidates)
         self.stats['evaluated'] = len(self.results)
+        
         self._log_stats()
+        
         if self.results:
             result_df = pd.DataFrame(self.results)
             # 按总分降序排序
@@ -81,12 +94,14 @@ class ChenKaiStrategyEngine:
             return result_df
         else:
             return pd.DataFrame()
+    
     def _preprocess_data(self):
         """数据预处理"""
         self.raw_data['trade_date'] = pd.to_datetime(self.raw_data['trade_date'])
         self.raw_data.sort_values(['ts_code', 'trade_date'], inplace=True)
         # 修改点：将日期设为索引，确保后续逻辑中使用的是日期索引而非整数索引
         self.raw_data.set_index('trade_date', inplace=True)
+    
     def _basic_filter(self, groups: list) -> dict:
         """
         基础硬性筛选
@@ -101,6 +116,7 @@ class ChenKaiStrategyEngine:
             if passed:
                 candidates[ts_code] = df_stock
         return candidates
+    
     def _check_basic_criteria(
         self,
         ts_code: str,
@@ -118,28 +134,35 @@ class ChenKaiStrategyEngine:
         df = df[df.index <= pd.to_datetime(self.target_date)]
         if df.empty:
             return False, "无数据"
+        
         curr_row = df.iloc[-1]
         cfg = config.BasicFilter
+        
         # 1. 上市时间
         list_date = pd.to_datetime(curr_row['list_date'])
         list_days = (pd.to_datetime(self.target_date) - list_date).days
         if list_days < cfg.MIN_LIST_DAYS:
             self.stats['fail_list_days'] += 1
             return False, f'上市天数{list_days}<{cfg.MIN_LIST_DAYS}'
+        
         # 2. 流通市值
         circ_mv_yi = curr_row['circ_mv'] / 10000
         if circ_mv_yi < cfg.MIN_CIRC_MV:
             self.stats['fail_circ_mv'] += 1
             return False, f'流通市值{circ_mv_yi:.1f}<{cfg.MIN_CIRC_MV}'
+        
         # 3. 换手率
         if len(df) < 20:
             self.stats['fail_turnover'] += 1
             return False, '数据不足20天'
+        
         avg_turnover = df['turnover_rate'].iloc[-20:].mean()
         if avg_turnover < cfg.MIN_TURNOVER_20:
             self.stats['fail_turnover'] += 1
             return False, f'换手率{avg_turnover:.2f}<{cfg.MIN_TURNOVER_20}'
+        
         return True, None
+    
     def _evaluate_patterns(self, candidates: dict):
         """
         对候选股票进行形态评分
@@ -148,6 +171,7 @@ class ChenKaiStrategyEngine:
         """
         for ts_code, df in tqdm(candidates.items(), desc="陈凯收敛图评分"):
             self._evaluate_single_stock(ts_code, df)
+    
     def _evaluate_single_stock(self, ts_code: str, df: pd.DataFrame):
         """
         评估单只股票
@@ -158,27 +182,39 @@ class ChenKaiStrategyEngine:
         # 修改点：使用 df.index 进行过滤，因为 trade_date 现在是索引
         df = df[df.index <= pd.to_datetime(self.target_date)]
         curr_row = df.iloc[-1]
+        
         # 计算基础统计信息
         list_date = pd.to_datetime(curr_row['list_date'])
         list_days = (pd.to_datetime(self.target_date) - list_date).days
         circ_mv_yi = curr_row['circ_mv'] / 10000
         avg_turnover = df['turnover_rate'].iloc[-20:].mean()
+        
         # 使用形态管理器进行评分
         pattern_results = self.pattern_manager.evaluate(df)
+        
         # 提取陈凯收敛图结果
         ck_result = pattern_results['chenkai']['score']
+        
         # 记录分数分布
         self.score_distribution.append(ck_result['total'])
+        
         # 格式化形态标签
         patterns = self.pattern_manager.format_patterns_label(pattern_results)
+        
         # 提取详细得分
         dim1_details = ck_result.get('dim1_details', {})
         dim2_details = ck_result.get('dim2_details', {})
         dim3_details = ck_result.get('dim3_details', {})
         features = ck_result.get('pattern_features', {})        
-        # 提取debug信息(高低点详情)
+        
+        # 🔧 修复：提取 debug 信息并展开存储
         debug_peaks = dim2_details.get('debug_peaks', {})
         debug_troughs = dim2_details.get('debug_troughs', {})
+        
+        # 将高低点数据序列化为 JSON 字符串（备用方案）
+        debug_peaks_json = json.dumps(debug_peaks, ensure_ascii=False) if debug_peaks else ''
+        debug_troughs_json = json.dumps(debug_troughs, ensure_ascii=False) if debug_troughs else ''
+        
         # 生成备注
         remark_parts = []
         if dim1_details.get('details'):
@@ -188,6 +224,7 @@ class ChenKaiStrategyEngine:
             for k, v in dim2_details['details'].items():
                 remark_parts.append(f"{k}: {v}")
         remark = "; ".join(remark_parts[:3])  # 只取前3条
+        
         # 构建结果记录
         record = {
             'ts_code': ts_code,
@@ -204,12 +241,16 @@ class ChenKaiStrategyEngine:
             'dim3_score': ck_result['dim3_score'],
             'patterns': patterns,
             'remark': remark,
-            # Debug信息
-            'debug_info': {
-                'peaks': debug_peaks,
-                'troughs': debug_troughs
-            }
+            # 🔧 修复：将 debug 信息展开为独立列
+            'debug_peaks_values': debug_peaks.get('values', []) if debug_peaks else [],
+            'debug_peaks_dates': debug_peaks.get('dates', []) if debug_peaks else [],
+            'debug_troughs_values': debug_troughs.get('values', []) if debug_troughs else [],
+            'debug_troughs_dates': debug_troughs.get('dates', []) if debug_troughs else [],
+            # 备用：JSON 字符串格式
+            'debug_peaks_json': debug_peaks_json,
+            'debug_troughs_json': debug_troughs_json,
         }
+        
         # 添加详细分项
         if config.INCLUDE_SCORE_DETAILS:
             record.update({
@@ -232,18 +273,26 @@ class ChenKaiStrategyEngine:
                 'trough_count': features.get('trough_count', 0),
                 'convergence_days': features.get('convergence_days', 0),
                 'h1': features.get('h1', 0),
+                'h1_date': features.get('h1_date'),
                 'h2': features.get('h2', 0),
+                'h2_date': features.get('h2_date'),
                 'h3': features.get('h3', 0),
+                'h3_date': features.get('h3_date'),
                 'l1': features.get('l1', 0),
+                'l1_date': features.get('l1_date'),
                 'l2': features.get('l2', 0),
+                'l2_date': features.get('l2_date'),
                 'amplitude_ratio': features.get('amplitude_ratio', 0),
             })
+        
         self.results.append(record)
+    
     def _log_stats(self):
         """输出统计信息"""
         self.logger.info("\n" + "=" * 60)
         self.logger.info("📊 选股统计汇总")
         self.logger.info("=" * 60)
+        
         # 基础筛选统计
         self.logger.info("\n【阶段1: 基础筛选】")
         self.logger.info(f"  总样本池: {self.stats['total']} 只")
@@ -251,15 +300,18 @@ class ChenKaiStrategyEngine:
             f"  ✅ 通过: {self.stats['passed_basic']} 只 "
             f"({self.stats['passed_basic']/self.stats['total']*100:.1f}%)"
         )
+        
         if self.stats['total'] - self.stats['passed_basic'] > 0:
             self.logger.info(f"  ❌ 淘汰: {self.stats['total'] - self.stats['passed_basic']} 只")
             self.logger.info(f"     - 上市时间不足: {self.stats['fail_list_days']} 只")
             self.logger.info(f"     - 流通市值不足: {self.stats['fail_circ_mv']} 只")
             self.logger.info(f"     - 换手率不足: {self.stats['fail_turnover']} 只")
+        
         # 形态评分统计
         if self.stats['passed_basic'] > 0:
             self.logger.info("\n【阶段2: 陈凯收敛图评分】")
             self.logger.info(f"  评分标的数: {self.stats['evaluated']} 只")
+            
             # 分数分布
             if self.score_distribution:
                 scores = np.array(self.score_distribution)
@@ -267,10 +319,13 @@ class ChenKaiStrategyEngine:
                 self.logger.info(f"     - 平均分: {scores.mean():.1f}")
                 self.logger.info(f"     - 中位数: {np.median(scores):.1f}")
                 self.logger.info(f"     - 最高分: {scores.max():.1f}")
+                
                 excellent = (scores >= 90).sum()
                 good = ((scores >= 80) & (scores < 90)).sum()
                 acceptable = ((scores >= 70) & (scores < 80)).sum()
+                
                 self.logger.info(f"     - 优秀(≥90分): {excellent} 只")
                 self.logger.info(f"     - 良好(80-90分): {good} 只")
                 self.logger.info(f"     - 及格(70-80分): {acceptable} 只")
+        
         self.logger.info("\n" + "=" * 60)
